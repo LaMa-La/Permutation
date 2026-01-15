@@ -11,14 +11,20 @@ output:
 ---
 
 ```{r}
-#library(Permutation)
-library(devtools)
-#library(tidydr)
-#library(patchwork)
-```
+ # devtools::install_git("git@gitlab.dzne.de:langl/fdr-workflow.git", upgrade = "never")
 
-```{r}
-devtools::load_all()
+library(future)
+library(future.apply)
+library(parallel)
+
+library(Permutation)
+library(Seurat)
+library(ggplot2)
+library(tidydr)
+library(patchwork)
+library(DESeq2)
+library(psupertime)
+library(SingleCellExperiment)
 ```
 
 
@@ -51,10 +57,11 @@ options(future.globals.maxSize= 16000 * 1024^2)
 ------
 ------
 
-# Load seurat 
+# Prep 
 
 ```{r}
-seurat_analysis <- readRDS("/data/references/public_datasets/Vasaikar_NatureCommunications_2023/PALMO_seurat_monocytes_cleaned_LL.rds")
+# Download example data from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE190992
+seurat_analysis <- readRDS("/input/PALMO_seurat.rds")
 ```
 
 ```{r}
@@ -87,7 +94,7 @@ p1 + p2 + p3 + plot_layout(ncol = 3)
 
 ```{r}
 # Path to your output directory
-outdir <- "/data/Femmunity/analysis/laura/external_data/PALMO/test_package/"
+outdir <- "/data/output/"
 ```
 
 ```{r}
@@ -110,12 +117,12 @@ Seurat::Idents(seurat_analysis) <- "time"
 seurat_analysis <- Seurat::FindVariableFeatures(object = seurat_analysis, assay="RNA", selection.method = 'vst', nfeatures=5000)
 ```
 
+# Permutation workflow
+
 ```{r}
-#undebug("permutation")
 seurat_analysis <- permutation(seurat_analysis, method = "longitudinal", numeric = "custom", numeric.function = function(x){as.numeric(str_split(x, pattern =  "W", simplify = T)[,2])})
 ```
 
-#Example workflow
 
 ```{r}
 corr.plot.permutation(seurat_analysis, time.var = "time", numeric.function = function(x){as.numeric(str_split(x, pattern =  "W", simplify = T)[,2])} )
@@ -139,7 +146,6 @@ comparison.group2 = rep("W2", 5),
 ```
 
 ```{r}
-# undebug("Perm_DEcall")
 DEG.perm <- Perm_DEcall(seurat_analysis = seurat_analysis, method = c(
 "seurat_wilcox",
 "linear_TDE",
@@ -151,13 +157,22 @@ comparison.group2 = rep("W2", 5),
 ```
 
 ## Permutation pseudotime
+
 ```{r}
-psuper_palmo <-readRDS("/data/Femmunity/analysis/laura/external_data/240812_psupertime_palmo.rds")
+Idents(seurat_PALMO_mono) <- "orig.ident"
+seurat_analysis_small <- subset(seurat_analysis, downsample = 1000, seed = 42)
+sce <- as.SingleCellExperiment(seurat_analysis_small)
+sce@colData$time <- factor(sce@colData$time, levels = sort(unique(sce@colData$time)))
 ```
 
-```{r, message=FALSE}
-Idents(seurat_analysis) <- "orig.ident"
-seurat_analysis_small <- subset(seurat_analysis, downsample = 1000, seed = 42)
+```{r}
+library(psupertime)
+```
+
+```{r}
+y <- sce@colData$time
+psuper_palmo <-psupertime(sce@assays@data$logcounts, y, sel_genes='list',gene_list = seurat_PALMO_mono@assays$RNA@var.features, seed=1234)
+psuper_palmo
 ```
 
 ```{r}
@@ -165,12 +180,10 @@ seurat_analysis_small <- AddMetaData(object = seurat_analysis_small, metadata = 
 ```
 
 ```{r}
-#undebug("permutation")
 seurat_analysis_small <- permutation(seurat_analysis_small, method = "longitudinal", time.var = "psupertime", perm_prefix = "psupertime_")
 ```
 
 ```{r}
-#undebug("plot.pseudotime.permutation")
 plot.pseudotime.permutation(seurat_analysis_small, perm = c("psupertime", "psupertime_perm1","psupertime_perm2","psupertime_perm3","psupertime_perm4","psupertime_perm5"), color = list("time" = color_time, "donor" = color_clusters))
 ```
 
@@ -180,7 +193,6 @@ corr.plot.permutation(seurat_analysis_small, time.var = "psupertime", perm.list 
 ```
 
 ```{r}
-#undebug("Perm_DEcall")
 DEG.perm <- Perm_DEcall(seurat_analysis = seurat_analysis_small, method = c(
 "tradeseq_psupertime_latent"
  ),
@@ -190,12 +202,7 @@ perm = c("psupertime_perm1", "psupertime_perm2", "psupertime_perm3", "psupertime
 
 ## Plots
 
-```{r}
-DEG.perm <- readRDS("/data/Femmunity/analysis/laura/FDR_results_summary/241212_DEG_perm_palmo.rds")
-```
-
 ```{r, fig.width=15, fig.height=8}
-debug("plot_DEG")
 plot_DEG(DEG.perm = DEG.perm)
 ```
 
@@ -230,7 +237,7 @@ plot_FPR_point(fpr_df)
 ## Detection power
 
 ```{r}
-outdir <- "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_"
+outdir <- "/data/outdir/detection_power/"
 ```
 
 ```{r}
@@ -238,41 +245,28 @@ dds <- generate_pseudobulk(seurat_analysis)
 ```
 
 ```{r}
-# DEG.power <- Power_DEcall_pseudobulk(dds, method = c("pseudobulk_DESeq2_Wald", "pseudobulk_DESeq2_LRT"),
-# comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
-# comparison.group2 = rep("W2", 5),
-#  save_DEG = F, outdir = outdir, shrinkType = "apeglm")
+DEG.power <- Power_DEcall_pseudobulk(dds, method = c("pseudobulk_DESeq2_Wald", "pseudobulk_DESeq2_LRT"),
+comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+comparison.group2 = rep("W2", 5),
+ save_DEG = F, outdir = outdir, shrinkType = "apeglm")
 ```
 
 ```{r}
-# DEG.power <- Power_DEcall(seurat_analysis = seurat_analysis, method = c(
-# "seurat_wilcox",
-# "linear_TDE",
-# "mixed_TDE",
-# "seurat_MAST",
-# "seurat_MAST_latent",
-# "MAST_longitudinal",
-# "MAST_longitudinal_RE",
-# "MAST_longitudinal_fixed",
-# "tradeseq_latent"
-#  ),
-# comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
-# comparison.group2 = rep("W2", 5),
-# gene_filter = seurat_analysis@assays$RNA@var.features[1:50], tde_method = c("linear" = "cell", "mixed"="pseudocell"),
-# save_DEG = F, ncores = 5,  outdir = outdir)
-```
-
-```{r}
-DEG.power <- load_DEG( c("seurat_wilcox" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_wilcox_power.rds",
- "pseudobulk_DESeq2_Wald"= "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_pseudobulk_DESeq2_Wald_power.rds",
- "pseudobulk_DESeq2_LRT"= "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_pseudobulk_DESeq2_LRT_power.rds", 
- "linear_TDE" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_linear_TDE_power.rds",
- "mixed_TDE" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_mixed_TDE_power.rds",
- "seurat_MAST" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_MAST_power.rds",
- "seurat_MAST_latent" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_MAST_latent_power.rds",
- "MAST_longitudinal"  = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_power.rds",
- "MAST_longitudinal_RE"  = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_RE_power.rds",
- "MAST_longitudinal_fixed" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_fixed_power.rds"))
+DEG.power <- Power_DEcall(seurat_analysis = seurat_analysis, method = c(
+"seurat_wilcox",
+"linear_TDE",
+"mixed_TDE",
+"seurat_MAST",
+"seurat_MAST_latent",
+"MAST_longitudinal",
+"MAST_longitudinal_RE",
+"MAST_longitudinal_fixed",
+"tradeseq_latent"
+ ),
+comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+comparison.group2 = rep("W2", 5),
+gene_filter = seurat_analysis@assays$RNA@var.features[1:50], tde_method = c("linear" = "cell", "mixed"="pseudocell"),
+save_DEG = F, ncores = 5,  outdir = outdir)
 ```
 
 ```{r}
