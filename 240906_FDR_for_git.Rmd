@@ -1,0 +1,2194 @@
+---
+title: "FDR analysis with permutation"
+author: "Laura"
+date: "2024-03-01"
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+# Preparations
+
+## Packages
+
+```{r}
+library(future)
+library(future.apply)
+library(foreach)
+library(doParallel)
+
+library(dplyr)
+library(useful)
+library(tidyr)
+library(tibble)
+
+library(RColorBrewer)
+library(gplots)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(ggExtra)
+library(gridExtra)
+library(tidydr)
+library(scCustomize)
+library(patchwork)
+library(plotly)
+
+library(Seurat)
+library(SeuratDisk)
+library(SingleCellExperiment)
+
+#library(SingleR)
+library(harmony)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(UpSetR)
+
+library(stringr)
+library(cowplot)
+
+library(ComplexHeatmap)
+
+library(colorspace)
+library(ggplotify)
+
+library(scales)
+library(ggridges)
+library(fgsea)
+library(knitr)
+library(tradeSeq)
+library(condiments)
+library(enrichplot)
+```
+
+## Functions
+
+---
+---
+
+# Functions
+## Perm functions
+
+
+### Permutation
+```{r}
+permutation <- function(seurat_analysis,
+                        method = "donor_longitudinal", #or "donor", "random"
+                        donor.var = "PID",
+                        time.var = "time", #can also be pseudotime
+                        remove.previous = T, 
+                        seed = c(360, 90, 477, 26, 551),#Set as many seeds as permutation rounds
+                        perm_prefix = NULL, 
+                        numeric = "default",
+                        numeric.function = NULL
+    ){
+# Permutation that preserves donor structure
+
+if(remove.previous){
+## Remove potential previous permutations
+m <- colnames(seurat_analysis@meta.data)[grep("perm",colnames(seurat_analysis@meta.data))]
+ for (n in m){
+   seurat_analysis[[n]] <- NULL
+ }}
+
+
+
+#Loop through all seed
+for(i in 1:length(seed)){
+print(paste("Permutation round", i, sep=" "))
+
+
+data <- list()
+data_df <- data.frame()
+
+# generate Permutation method donor longitudinal
+if (method == "donor_longitudinal"){
+for (p in unique(seurat_analysis@meta.data[,donor.var])){
+Idents(seurat_analysis) <- donor.var
+tmp <- subset(seurat_analysis, idents=p)
+set.seed(seed[i])
+data[[p]] <- sample(tmp@meta.data[,time.var])
+names(data[[p]]) <- NULL
+data_df <- rbind(data_df, data.frame("data" = data[[p]], "PID" = p))
+}
+# This is a super complicated way to make sure that the donors still match, which they did not fully do before
+data_df <- data_df[order(data_df$PID),]
+rownames(data_df) <- sort(names(seurat_analysis$PID))
+data_add <- data_df$data
+names(data_add) <- rownames(data_df)
+seurat_analysis <- AddMetaData(seurat_analysis, data_add, col.name = paste0(perm_prefix,"perm", i))
+}
+
+# generate Permutation method donor cross-sectional
+if (method == "donor"){
+set.seed(seed[i])
+data <- sample(seurat_analysis@meta.data[,time.var], length(unique(seurat_analysis@meta.data[,donor.var])))
+names(data) <- unique(seurat_analysis@meta.data[,donor.var])
+
+#Here permutation is done on a donor level not cell level to ensure the donor structure is preserved
+seurat_analysis[[paste0(perm_prefix,"perm", i)]] <- data[seurat_analysis@meta.data[,donor.var]]  
+}
+
+# generate Permutation method random
+if (method == "random"){
+set.seed(seed[i])
+data <- sample(seurat_analysis@meta.data[,time.var])
+names(data) <- NULL
+seurat_analysis[[paste0(perm_prefix,"perm", i)]] <- data
+}
+
+
+
+
+# generate other variables
+#Create the numeric version of the permuted time variable, adapt if necessary (output will be named perm1_num, perm2_num, ...)
+if(numeric == "default"){
+seurat_analysis[[paste0(perm_prefix,"perm", i, "_num")]] <- as.numeric(seurat_analysis@meta.data[,paste0(perm_prefix,"perm", i)]) 
+}
+if(numeric == "custom"){
+seurat_analysis[[paste0(perm_prefix,"perm", i, "_num")]] <- numeric.function(seurat_analysis@meta.data[,paste0(perm_prefix,"perm", i)]) 
+}
+
+#Donor permutation combinations needed for pseudobulk generation (output will be named PID_perm1, PID_perm2, ...)
+seurat_analysis[[paste0("PID_", "perm", i)]] <- paste(seurat_analysis$PID, seurat_analysis@meta.data[,paste0(perm_prefix,"perm", i)],sep="_")
+
+#Donor and numeric permutation combination (output will be named PID_perm1_num, PID_perm2_num, ...)
+seurat_analysis[[paste0("PID_", "perm", i, "_num")]] <- paste(seurat_analysis$PID, seurat_analysis@meta.data[,paste0(perm_prefix,"perm", i, "_num")] ,sep="_")
+}
+return(seurat_analysis)
+}
+```
+
+### Permutation plots
+```{r}
+#Correltation matrix between original and permuted data
+corr.plot.permutation <- function(seurat_analysis,
+                      time.var = "time_num", 
+                      perm.list = c("perm1", "perm2", "perm3", "perm4", "perm5"),
+                      numeric.function = function(x){as.numeric(x)}
+                      ){
+  
+#Check if there is residual correlation between the original time label and the permutations 
+  
+# create dataframe
+cor <- data.frame(seurat_analysis[[c(time.var, perm.list)]])
+
+colnames(cor) <- c("original", perm.list)
+cor <- data.frame(lapply(cor, numeric.function #data needs to be numeric
+))
+
+p <- wrap_elements(~corrplot::corrplot.mixed(cor(cor), tl.col ="black", lower.col ="black"))
+
+
+return(p)
+}
+```
+
+```{r}
+# Cell numbers per donor
+plot.donor.permutation <- function(seurat_analysis,
+                        donor.var = "PID",
+                        time.var = c("time", "perm1", "perm2", "perm3", "perm4", "perm5"), 
+                        color = brewer.pal(n = 9,name = "Set1"),
+                        plots = c("relative", "absolute")){
+
+plt_list <- list()
+
+if("absolute" %in% plots){
+  for (p in time.var){
+plt_list[[paste0("absolute_",p)]] <- ggplot(seurat_analysis@meta.data, aes(x=.data[[donor.var]], fill=.data[[p]])) + 
+  geom_bar() + 
+  scale_fill_manual(values=color) + 
+  theme_bw() + theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1)) + 
+  xlab("Donor") + ylab("Number of cells") 
+
+}}
+
+if("relative" %in% plots){
+  for (p in time.var){
+plt_list[[paste0("relative_",p)]]<- ggplot(seurat_analysis@meta.data, aes(x= .data[[donor.var]], fill=.data[[p]])) + 
+  geom_bar(position = "fill") + 
+  scale_fill_manual(values=color) + 
+  theme_bw() + theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1)) + 
+  xlab("Donor") + ylab("Percentage of cells") 
+}}
+
+ggarrange(plotlist = plt_list, ncol = 3, nrow = length(plt_list)/3)
+
+}
+```
+
+### Permutation DE call
+```{r}
+Perm_DEcall <- function(seurat_analysis,
+                        method = c("seurat_wilcox","seurat_MAST", "seurat_MAST_latent"), #Does support Seurat, MAST, TDESeq and Tradeseq DE call
+                        donor.var = "PID",
+                        perm = c("perm1","perm2","perm3", "perm4", "perm5"),
+                        comparison.group1 = c("V2", "V3", "V4"), 
+                        comparison.group2 = rep("V1", 3),
+                        seurat.test.use = list(),
+                        min.pt = 0.1,
+                        gene_filter = seurat_analysis@assays$RNA@var.features,
+                        tde_method = c("linear"="cell", "mixed"="pseudocell"),
+                        cellWeights = NULL,
+                        nknots = 6,
+                        save_DEG = TRUE,
+                        save_model = FALSE,
+                        outdir = NULL,
+                        verbose = TRUE, 
+                        ncores = 1
+                         ){
+
+#Data prep
+  ## For seurat
+if(any(grepl("seurat", method, ignore.case = T) | grepl("MAST", method, ignore.case = T)& !grepl("longitudinal", method, ignore.case = T))){  
+    #Define comparisons
+  comparisons.df <- data.frame("group1" = comparison.group1, 
+                             "group2" = comparison.group2)
+  comparisons.df$comparison <- paste0(comparisons.df$group1, "_vs_", comparisons.df$group2)
+  
+  plan(multisession, workers = ncores)
+  } 
+
+  ## For MAST  
+if(any(!grepl("seurat", method, ignore.case = T) & grepl("MAST", method, ignore.case = T))){ 
+
+sca <- MAST::SceToSingleCellAssay(as.SingleCellExperiment(seurat_analysis))
+if(!is.null(gene_filter)){sca <- sca[gene_filter,]}
+options("mc.cores" = ncores)
+
+if(length(seurat_analysis@meta.data[,donor.var])> 60000 & any(grepl("longitudinal", method, ignore.case = T))){
+  print("Warning: Data with more than 60.000 cells causes errors in longitudinal MAST model fitting with ebayes. Setting ebayes to FALSE")
+  ebayes <- FALSE
+  }else{ebayes <- TRUE}
+} 
+
+  ## For TDESeq
+if(any(grepl("TDE", method, ignore.case = T))){
+counts<-GetAssayData(seurat_analysis,'counts')
+norm.data<-GetAssayData(seurat_analysis,'data')
+meta.data<-seurat_analysis@meta.data
+
+tde_perm <- CreateTDEseqObject(counts = counts, data=norm.data, meta.data = meta.data)
+}
+
+  ## TradeSeq
+if(any(grepl("tradeseq", method, ignore.case = T))){
+BPPARAM <- BiocParallel::bpparam()
+BPPARAM$workers <- ncores
+}
+
+DEG.perm <- list()  
+  
+for (m in method){  
+  if(verbose){print(m)}
+DEG.perm[[m]] <- data.frame()
+
+# Seurat based tests
+if(grepl("seurat", m, ignore.case = T)){
+  #Determine the test to use based on the method string
+  test <- ifelse(grepl("wilcox", m, ignore.case = T),  "wilcox", 
+         ifelse(grepl("DESeq2", m, ignore.case = T),"DESeq2", 
+         ifelse(grepl("MAST", m, ignore.case = T),"MAST", seurat.test.use[[m]])))
+  
+  # Include latent variable based on method string
+ if (grepl("latent", m, ignore.case = TRUE)){
+  latent.var <- donor.var} else {
+  latent.var <- NULL }
+  
+
+
+# Loop through the permutations  
+for (p in perm){
+  if(verbose){print(p)}
+  #Loop through comparisons
+for(c in comparisons.df$comparison){
+  if(verbose){print(paste0("Performing DE call for ", c))}
+  Idents(seurat_analysis) <- p
+  tmp <- FindMarkers(object = seurat_analysis,
+                     ident.1 = comparisons.df[comparisons.df$comparison==c,]$group1,
+                     ident.2 = comparisons.df[comparisons.df$comparison==c,]$group2,
+                     only.pos = FALSE,
+                     features = gene_filter,
+                     verbose = verbose,
+                     min.pct = min.pt,
+                     logfc.threshold = 0,
+                     test.use = test,
+                     latent.vars =  latent.var)
+  tmp <- tmp[!is.na(tmp$p_val),]
+  if (nrow(tmp) > 1){
+  tmp$comparison <- c
+  tmp$gene <- row.names(tmp)
+  tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$p_val_adj < 0.05, "sign", "ns")
+  tmp$comparison <- factor(tmp$comparison, levels=unique(tmp$comparison))
+  tmp$comparison_regulation <- paste(tmp$comparison, tmp$regulation, sep="_")
+  tmp$permutation_round <- p
+  tmp$time <- str_split(tmp$comparison, "_", simplify = T)[,1]
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+  }}}} #close seurat loop
+
+
+# longitudinal MAST based tests
+if(!grepl("seurat", m, ignore.case = T) & grepl("MAST", m, ignore.case = T)& grepl("longitudinal", m, ignore.case = T)){
+
+zlmTime_perm <- list()
+
+for (p in perm){
+  
+  ifelse(!is.numeric(colData(sca)[,time.var]), x <- paste0(time.var, "_num"), x <- time.var) # numerical input is required
+  # Create formula based on method string
+  formula <- as.formula(ifelse(grepl("fixed", m, ignore.case = T)|grepl("FE", m, ignore.case = T),  paste("~", x, "+", donor.var), 
+         ifelse(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T),paste("~", x, "+ (1|", donor.var, ")"),
+         paste("~", x))))  
+  
+  if(verbose){print(paste("Fitting model for", p, "with formula:", deparse(formula)))}
+  
+  # Fit the MAST model
+  zlmTime_perm[[p]] <- if(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T)){ 
+                      MAST::zlm(formula, sca, parallel = T, method = "glmer", ebayes = F)}
+                      else {
+                      MAST::zlm(formula, sca = sca, parallel = T, ebayes = ebayes)}   
+
+
+if(save_model){saveRDS(zlmTime_perm, file = paste0(outdir, "zlm_",m,"_perm.rds"))}
+}
+
+for (p in perm){
+  if(verbose){print(paste("Doing DE call for", p))}
+  x <- paste0(p, "_num") 
+summaryCond_perm <- MAST::summary(zlmTime_perm[[p]], doLRT= x, parallel = T)
+
+
+summaryDt_perm <- summaryCond_perm$datatable
+tmp <- data.frame(merge(summaryDt_perm[contrast==x & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                      summaryDt_perm[contrast==x & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid')) #logFC coefficients
+
+colnames(tmp) <- c("gene", "p_val", "avg_log2FC", "ci.hi", "ci.lo")
+tmp <- tmp[!is.na(tmp$p_val),]
+tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+rownames(tmp) <- tmp$gene
+tmp$p_val_adj <- p.adjust(tmp$p_val, 'fdr')
+tmp$permutation_round <- p
+tmp$comparison <- "longitudinal"
+
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+}}# closing MAST loop 
+
+
+# MAST pairwise
+if(!grepl("seurat", m, ignore.case = T) & grepl("MAST", m, ignore.case = T)& !grepl("longitudinal", m, ignore.case = T)){
+
+zlmTime_perm <- list()
+
+for (p in perm){
+  for(control in unique(comparisons.df$group2)){
+  x <- p # categorical input is required
+  colData(sca)[,x] <- factor(colData(sca)[,x])
+  colData(sca)[,x] <- relevel(colData(sca)[,x],control)
+  # Create formula based on method string
+  formula <- as.formula(ifelse(grepl("fixed", m, ignore.case = T)|grepl("FE", m, ignore.case = T),  paste("~", x, "+", donor.var), 
+         ifelse(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T),paste("~", x, "+ (1|", donor.var, ")"),
+         paste("~", x))))  
+  
+  if(verbose){print(paste("Fitting model for reference level:",control, "and", p, "with formula:", deparse(formula)))}
+  
+  #Fit the MAST model
+  zlmTime_perm[[paste0(p,control)]] <- if(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T)){
+                      MAST::zlm(formula, sca, parallel = T, method = "glmer", ebayes = F)}
+                      else {
+                      MAST::zlm(formula, sca = sca, parallel = T, ebayes = ebayes)}
+
+
+if(save_model){saveRDS(zlmTime_perm, file = paste0(outdir, "zlm_",m,"_perm.rds"))}
+}}
+
+for (p in perm){
+  for (c in unique(comparisons.df$comparison)){
+  if(verbose){print(paste("Doing DE call for",c, "and" ,p))}
+  a <- paste0(p,comparisons.df[comparisons.df$comparison == c,]$group1)
+summaryCond_perm <- MAST::summary(zlmTime_perm[[paste0(p,comparisons.df[comparisons.df$comparison == c,]$group2)]], doLRT= a , parallel = T)
+
+
+summaryDt_perm <- summaryCond_perm$datatable
+tmp <- data.frame(merge(summaryDt_perm[contrast==a & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                      summaryDt_perm[contrast==a & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid')) #logFC coefficients
+
+colnames(tmp) <- c("gene", "p_val", "avg_log2FC", "ci.hi", "ci.lo")
+tmp <- tmp[!is.na(tmp$p_val),]
+tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+rownames(tmp) <- tmp$gene
+tmp$p_val_adj <- p.adjust(tmp$p_val, 'fdr')
+tmp$permutation_round <- p
+tmp$comparison <- c
+
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+}}}# closing MAST pairwise loop 
+
+# TDESeq tests
+if(grepl("TDE", m, ignore.case = T)){
+ifelse(grepl("linear", m, ignore.case = T), tde_method <- tde_method["linear"], tde_method <- tde_method["mixed"] )
+
+model <- ifelse(grepl("mixed", m, ignore.case = T), "lmm", "lm")
+
+#Loop through the permutations
+for (p in perm){
+  if(verbose){print(p)}
+  tde_param <- list(sample.var = donor.var,
+                 stage.var = p,
+                 fit.model = model, # This defines the model to be linear or mixed
+                 tde.thr = 0.05,
+                 pct = min.pt,
+                 mod = 'FastLMM')
+
+tde_perm <- tdeseq(object = tde_perm, tde.method=tde_method, tde.param=tde_param, num.core= ncores)
+tmp <- GetTDEseqAssayData(tde_perm, slot='tde')
+tmp <- tmp[!is.na(tmp$pvalue),]
+tmp$permutation_round <- p
+tmp$regulation <- ifelse(tmp$patter %in% c("Recession","Trough"),"down",
+                  ifelse(tmp$patter %in% c("None"), "None", 
+                  "up"))
+tmp$comparison <- "longitudinal"
+ DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp )
+}}#closing TDESeq loop
+
+
+# Tradeseq
+if(grepl("tradeseq", m, ignore.case = T)){
+ 
+if (grepl("latent", m, ignore.case = TRUE)){
+  U <- model.matrix(~donor.var)} else { # (pseudo)time variable is added internally in the fitGAM function to the design matrix
+  U <- NULL }
+
+set.seed(42)
+ifelse(is.null(cellWeights),cellWeights <- data.frame("lineage" = rep(1, length(seurat_analysis[v,])), row.names = names(seurat_analysis[v,])), cellWeights <- cellWeights) # To define the lineages
+
+ifelse(is.null(gene_filter), genes <- seq_len(nrow(counts)), # default from tradeseq
+       genes <- gene_filter)
+
+gam_perm <- list()
+#Loop through perm to fit model
+for (p in perm){
+  if(verbose){print(paste("Fitting model for", p))}
+gam_perm[[p]] <- tradeSeq::fitGAM(counts = seurat_analysis@assays$RNA@counts,
+              pseudotime = seurat_analysis[[p]], 
+              cellWeights = cellWeights,
+              U = U,
+              nknots = nknots,
+              genes = genes,
+              parallel = TRUE,
+              BPPARAM = BPPARAM, 
+              verbose = verbose)
+}
+
+if(save_model){saveRDS(gam_perm, file = paste0(outdir,"GAM_", m, "_perm.rds"))}
+
+#Loop through perm for DE testing
+for (p in perm){
+  if(verbose){print(paste("Doing DE call for", p))}
+tmp <- associationTest(gam_perm[[p]])
+tmp <- tmp[!(is.na(tmp$pvalue)), ]
+tmp$padj <- p.adjust(tmp$pvalue, method = "fdr")
+tmp <- tmp[order(tmp$padj), ]
+tmp$gene <- rownames(tmp)
+tmp$permutation_round <- p
+tmp$regulation <- NA
+tmp$comparison <- "longitudinal"
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+
+}}# close tradeseq loop 
+
+
+if(save_DEG){saveRDS(DEG.perm[[m]], file = paste0(outdir, "DEG_",m,"_perm.rds"))}
+}#closing methods loop
+return(DEG.perm)
+}
+```
+
+#### Plot DEG
+```{r}
+#Plot number of DEG genes per permutation
+plot_DEG <- function(DEG.perm = DEG.perm,
+                     alpha = 0.05){
+  for (n in names(DEG.perm)){
+    plt_list <- list()
+    data_plot <- DEG.perm[[n]]
+    pvalue <- pvalue <- grep("^p.?val(ue)*((?!.adj))", names(data_plot), perl = T, value = T)
+    data_plot.sign <- data_plot[data_plot[,pvalue] <= alpha, ]
+    
+   plt_list[[paste0(n, "_p1")]]  <- ggplot(data_plot, aes(comparison, fill=regulation)) +
+  geom_bar(position = position_dodge()) +
+  scale_fill_manual(values = c(up = "firebrick4", down = "dodgerblue3")) +
+  theme_bw() +
+  geom_text(stat='count', aes(label=..count..), position=position_dodge2(width=0.8), size=5, vjust=0, hjust=0.5) +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = 0)) +
+  ggtitle("Permutation DEGs unfiltered") +
+  facet_wrap(.~ permutation_round, ncol = 5, scales = "free_x")+
+  xlab("")
+
+ plt_list[[paste0(n, "_p2")]]<- ggplot(data_plot.sign, aes(comparison, fill=regulation))+
+  geom_bar(position = position_dodge())+
+  scale_fill_manual(values = c(up = "firebrick4", down = "dodgerblue3"))+
+  theme_bw()+
+  geom_text(stat='count', aes(label=..count..), position=position_dodge2(width=0.8), size=5, vjust=0, hjust=0.5)+
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust = 0))+
+  ggtitle(paste0("Permutation DEGs (Pvalue <= ", alpha, ")"))+
+  facet_wrap(.~ permutation_round, ncol = 5, scales = "free_x")+
+  xlab("")
+ 
+  p <- ggarrange(plotlist = plt_list, ncol = 2, common.legend = T, legend = "right")
+  plot(annotate_figure(p, top = text_grob(n, 
+               color = "black", size = 16), fig.lab.pos = c("top.left")))
+  }}
+```
+
+
+
+#### pseudobulk
+```{r}
+### TX import
+tx_import <- function(file,
+                      aligner = c("STAR", "Kallisto")) {
+  
+  if(aligner == "STAR") {
+    tx <- read.delim(file = file,
+                     header = F , 
+                     stringsAsFactors = F,
+                     col.names = c("GENEID", "SYMBOL", "GENETYPE"))            
+    
+  } else if(aligner == "Kallisto") {
+    
+    tx <- read.delim(file = file,
+                     header = F , 
+                     stringsAsFactors = F,
+                     col.names = c("GENEID", "TXNAME", "SYMBOL", "GENETYPE"))
+    
+  } else {print("Unknown aligner - plase choose STAR or Kallisto")}
+  
+  return(tx)
+} 
+
+# Wrapper Function to perform DESeq2 differential testing
+DEAnalysis <- function(input = dds,
+                       condition,
+                       comparison_table = comparison_table,
+                       alpha = 0.05,
+                       lfcThreshold = 0,
+                       sigFC = 2,
+                       multiple_testing = "IHW",
+                       pAdjustMethod = "BH",
+                       independentFiltering= TRUE,
+                       shrinkage = TRUE,
+                       shrinkType = "normal", 
+                       norm_anno = norm_anno){
+  
+  setClass(Class = "DESeq2_analysis_object",
+           slots = c(results="data.frame", DE_genes="list", Number_DE_genes="list"))
+  
+  # create results_list
+  results_list <- list()
+  # print parameters
+  results_list$parameters <-list(multiple_testing = multiple_testing,
+                                 p_value_threshold = alpha,
+                                 log2_FC_threshold = lfcThreshold,
+                                 sigFC = sigFC,
+                                 shrinkage = shrinkage,
+                                 shrinkage_type = shrinkType)
+  # Run results() function on comparisons defined in comparison table
+  for (x in 1:nrow(comparison_table)){
+    # create DE_object
+    DE_object <- new(Class = "DESeq2_analysis_object")
+    # IHW
+    if (multiple_testing=="IHW") {
+      res_deseq_lfc <- results(input,
+                               contrast = c(condition,
+                                            paste(comparison_table$comparison[x]),
+                                            paste(comparison_table$control[x])),
+                               lfcThreshold = lfcThreshold,
+                               alpha = alpha,
+                               filterFun = ihw,
+                               pAdjustMethod = pAdjustMethod,
+                               altHypothesis = "greaterAbs")
+      # Independent Filtering
+    }else {
+      res_deseq_lfc <- results(input,
+                               contrast = c(condition,
+                                            paste(comparison_table$comparison[x]),
+                                            paste(comparison_table$control[x])),
+                               lfcThreshold = lfcThreshold,
+                               alpha = alpha,
+                               independentFiltering = independentFiltering,
+                               altHypothesis = "greaterAbs",
+                               pAdjustMethod= pAdjustMethod)
+    }
+    if(shrinkage == TRUE){
+      if(shrinkType %in% c("normal", "ashr")){
+        
+        res_deseq_lfc <- lfcShrink(input, 
+                                   contrast = c(condition,
+                                                paste(comparison_table$comparison[x]),
+                                                paste(comparison_table$control[x])),
+                                   res=res_deseq_lfc,
+                                   type = shrinkType)
+        
+      }else if(shrinkType == "apeglm"){
+        
+        res_deseq_lfc <- lfcShrink(input, 
+                                   coef = paste0(condition, "_",
+                                                 comparison_table$comparison[x], "_vs_",
+                                                 comparison_table$control[x]),
+                                   res=res_deseq_lfc,
+                                   type = shrinkType,
+                                   returnList = F)
+      }
+    }
+    res_deseq_lfc <- as.data.frame(res_deseq_lfc)
+    # indicate significant DE genes
+    res_deseq_lfc$regulation <- ifelse(!is.na(res_deseq_lfc$padj)&
+                                         res_deseq_lfc$padj <= alpha&
+                                         res_deseq_lfc$log2FoldChange > log(sigFC,2),
+                                       "up",
+                                       ifelse(!is.na(res_deseq_lfc$padj)&
+                                                res_deseq_lfc$padj <= alpha&
+                                                res_deseq_lfc$log2FoldChange < -log(sigFC,2),
+                                              "down",
+                                              "n.s."))
+    # add gene annotation to results table
+    res_deseq_lfc$GENEID <- row.names(res_deseq_lfc) 
+    res_deseq_lfc <- merge(res_deseq_lfc,
+                           norm_anno[,c("GENEID",
+                                        "SYMBOL",
+                                        "GENETYPE")],
+                           by = "GENEID") ################
+    row.names(res_deseq_lfc) <- res_deseq_lfc$GENEID
+    res_deseq_lfc$comparison<-paste(comparison_table$comparison[x]," vs ",comparison_table$control[x],
+                                    sep="")
+    # re-order results table
+    if (multiple_testing=="IHW") {
+      res_deseq_lfc<-res_deseq_lfc[,c("GENEID",
+                                      "SYMBOL",
+                                      "GENETYPE",
+                                      "comparison",
+                                      "regulation",
+                                      "baseMean",
+                                      "log2FoldChange",
+                                      "lfcSE",
+                                      "pvalue",
+                                      "padj"
+                                      )]
+    }else{
+      res_deseq_lfc<-res_deseq_lfc[,c("GENEID",
+                                      "SYMBOL",
+                                      "GENETYPE",
+                                      "comparison",
+                                      "regulation",
+                                      "baseMean",
+                                      "log2FoldChange",
+                                      "lfcSE",
+                                      "pvalue",
+                                      "padj")]
+    }
+    # print result table
+    DE_object@results <- res_deseq_lfc
+    # print DE genes in separate tables
+    DE_object@DE_genes <- list(up_regulated_Genes = res_deseq_lfc[res_deseq_lfc$regulation =="up",],
+                               down_regulated_Genes= res_deseq_lfc[res_deseq_lfc$regulation =="down",])
+    # print the numbers of DE genes
+    DE_object@Number_DE_genes <- list(up_regulated_Genes = nrow(DE_object@DE_genes$up_regulated_Genes),
+                                      down_regulated_Genes= nrow(DE_object@DE_genes$down_regulated_Genes))
+    # write DE_object into results_list
+    results_list[[paste(comparison_table$comparison[x], "vs", comparison_table$control[x], sep="_")]] <- DE_object
+  }
+  return(results_list)
+}
+```
+
+```{r }
+tx_annotation <- tx_import(file = "/data/references/gene_anno/ID2SYMBOL_gencode_v33.txt",
+aligner = "STAR") #Load reference file to convert gene symbols to IDs
+```
+
+```{r}
+generate_pseudobulk_perm <- function(seurat_analysis,
+                        gene_filter = seurat_analysis@assays$RNA@var.features,
+                        gene_filter_count = NULL,
+                        perm = c("perm1","perm2","perm3", "perm4", "perm5"), 
+                        assay = "RNA",
+                        design_matrix = ~ time + donor,
+                        save_DDS = FALSE,
+                        outdir = NULL,
+                        verbose = TRUE){
+  
+ pseudobulk_counts_perm <- list()
+sample_table_perm <- list()
+dds_perm <- list()
+norm_anno_perm <- list()
+for(i in perm){
+if(verbose){print(i)}
+pseudobulk_counts_perm[[i]] <- AggregateExpression(seurat_analysis, assays = assay , slot = "counts" ,return.seurat = F, group.by = paste0("PID_", i))[[assay]]
+
+# Filter for NAs
+pseudobulk_counts_perm[[i]] <- pseudobulk_counts_perm[[i]][!is.na(rownames(pseudobulk_counts_perm[[i]])),]
+
+# Generate Sample table from column names
+tmp <- data.frame(row.names = seq(1, length(as.character(colnames(pseudobulk_counts_perm[[i]])))))
+# mandatory columns
+
+## Ensure you generate a variable "ID" which matches the colnames in your pseudobulk counts matrix
+tmp$ID <- as.character(colnames(pseudobulk_counts_perm[[i]]))
+rownames(tmp) <- tmp$ID
+
+m <- stringr::str_split_fixed(as.character(colnames(pseudobulk_counts_perm[[i]])),pattern =  "_", n=2)
+# Ensure the presence of a column "condition" which will be used for the grouping of your samples
+tmp$condition <- factor(paste(m[,1], m[,2], sep="_"), levels = unique(paste(m[,1], m[,2], sep="_")))
+
+
+
+tmp$sample_name <- paste(m[,1], m[,2], sep="_")
+tmp$donor <- factor(m[,1], levels = sort(unique(m[,1])))
+
+
+# addtional columns
+tmp$time <- factor(m[,2], levels = sort(unique(m[,2])))
+
+
+# double-check your tmp includes all necessary information
+c("ID", "condition") %in% colnames(tmp)
+sample_table_perm[[i]] <- tmp
+
+dds_txi <- DESeqDataSetFromMatrix(countData = pseudobulk_counts_perm[[i]], colData = sample_table_perm[[i]] , design = as.formula(design_matrix))
+
+
+if(!is.null(gene_filter_count)){
+genes_to_keep <- rowSums(counts(dds_txi) >= gene_filter_count)}
+else{genes_to_keep <- gene_filter}
+
+dds <- dds_txi[genes_to_keep,]
+
+dds_perm[[i]] <- DESeq(dds)
+
+} 
+if(save_DDS){saveRDS(dds_perm, file = paste0(outdir, "Pseudobulk_dds_perm.rds"))}
+return(dds_perm)
+}
+```
+
+```{r}
+generate_norm_anno <- function(dds_object = dds,
+                               annotation_file = tx_annotation){
+  
+  norm_anno <- as.data.frame(counts(dds_object, normalized=T))
+  norm_anno$GENEID <- row.names(norm_anno)
+  
+  # add gene annotation
+  gene_annotation <- annotation_file[!duplicated(annotation_file$GENEID), c("GENEID", "SYMBOL", "GENETYPE")]
+  
+  # merge expression table and annotation
+  norm_anno <- dplyr::left_join(norm_anno, gene_annotation, by = "GENEID")
+  rownames(norm_anno) <- norm_anno$GENEID
+  
+  return(norm_anno)
+}
+```
+
+```{r}
+gernerate_norm_anno_perm <- function(dds_perm, verbose = T){
+for(i in names(dds_perm)){
+  if(verbose){print(i)}
+#Does contain the normalized data
+norm_anno_perm[[i]] <- generate_norm_anno(dds_object = dds_perm[[i]])
+}
+return(norm_anno_perm)}
+```
+
+
+```{r}
+Perm_DEcall_pseudobulk <- function(dds_perm,
+                        method = c("pseudobulk_DESeq2_Wald","pseudobulk_DESeq2_LRT"),
+                        comparison.group1 = c("V2", "V3", "V4"), 
+                        comparison.group2 = rep("V1", 3),
+                        design_matrix = ~ time + donor, 
+                        design_matrix_reduced = ~ donor, 
+                        donor.var = "PID",
+                        save_DEG = TRUE,
+                        outdir = NULL,
+                        verbose = TRUE, 
+                        ncores = 1, 
+                        multiple_testing = "IHW",
+                        pAdjustMethod = "BH",
+                        independentFiltering= TRUE,
+                        shrinkage = TRUE,
+                        shrinkType = "normal"){
+  
+if(ncores > 1){
+BPPARAM <- BiocParallel::bpparam()
+BPPARAM$workers <- ncores
+parallel <- TRUE}else{parallel <- FALSE}
+  
+DEG.perm <- list()  
+  
+for (m in method){  
+  if(verbose){print(m)}
+DEG.perm[[m]] <- data.frame()
+
+if(grepl("Wald", m, ignore.case = T)){
+ 
+# Generate Comparison table   
+comparison_table <- data.frame(comparison = comparison.group1,
+                               control = comparison.group2)
+  
+for (ds in names(dds_perm)){
+if(verbose){print(ds)}
+dds_dea <- dds_perm[[ds]] 
+
+design(dds_dea) <- as.formula(design_matrix)
+
+norm_anno <- generate_norm_anno(dds_object = dds_dea)
+
+# DE calculation
+DEresults_list <- list()
+
+for (i in unique(comparison_table$control)){
+  dds_dea$time <- relevel(dds_dea$time, i)
+  dds_dea <- nbinomWaldTest(object = dds_dea)
+  comparison_table_subset  <-  comparison_table[comparison_table$control == i, ]
+
+  DEresults <- DEAnalysis(input = dds_dea,
+                          comparison_table = comparison_table_subset,
+                          condition = "time",
+                          alpha = 0.05 ,
+                          lfcThreshold = 0,
+                          sigFC = 2,
+                          multiple_testing = multiple_testing,
+                          pAdjustMethod = pAdjustMethod,
+                          shrinkage = shrinkage,
+                          shrinkType = shrinkType, 
+                          norm_anno = norm_anno)
+  
+  DEresults_list <- c(DEresults_list, DEresults)
+}
+
+DEresults <- DEresults_list[unique(names(DEresults_list))]
+tmp <- data_frame()
+for (n in names(DEresults)){
+  if (n != "parameters"){
+  DEresults[[n]]@results$comparison <- rep(n, nrow(DEresults[[n]]@results))
+  tmp <- rbind(tmp, DEresults[[n]]@results)
+  }}
+  tmp$time <- str_split(tmp$comparison, "_", simplify = T)[,1]
+  tmp$permutation_round <- ds
+  tmp$regulation <- ifelse(tmp$log2FoldChange > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$padj < 0.05, "sign", "ns")
+  tmp$comparison <- factor(tmp$comparison, levels=unique(tmp$comparison))
+  tmp$comparison_regulation <- paste(tmp$comparison, tmp$regulation, sep="_")
+  tmp$gene <- tmp$GENEID
+  tmp[,c("GeneID","SYMBOL","GENETYPE")] <- NULL
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+  }} #close Wald loop
+
+if(grepl("LRT", m, ignore.case = T)){
+
+for (ds in names(dds_perm)){
+if(verbose){print(ds)}
+dds_dea <- dds_perm[[ds]]
+
+design(dds_dea) <- as.formula(design_matrix)
+
+# DE calculation
+dds_lrt <- DESeq(dds_dea, test = "LRT", reduced = as.formula(design_matrix_reduced), parallel = parallel, BPPARAM = BPPARAM)
+
+tmp <- results(dds_lrt)
+  tmp$permutation_round <- ds
+  tmp$regulation <- ifelse(tmp$log2FoldChange > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$padj < 0.05, "sign", "ns")
+  tmp$gene <- rownames(tmp)
+  tmp$comparison <- "longitudinal"
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], as.data.frame(tmp))
+
+}}#close LRT loop
+
+if(save_DEG){saveRDS(DEG.perm[[m]], file = paste0(outdir,"DEG_",m,"_perm.rds"))}
+}
+return(DEG.perm)
+}
+```
+
+### Load DEG
+```{r}
+#Load to DEG perm function
+load_DEG <- function(files = c("seurat_wilcox" = "DEG_seurat_wilcox_perm.rds")){
+  DEG <- list()
+  
+  for (f in names(files)){
+    DEG[[f]] <- readRDS(files[[f]])
+  }
+  
+return(DEG)
+}
+```
+
+
+### QQ plot
+```{r}
+Perm_QQplot <- function(DEG.perm = list("seurat_wilcox" = DEG.seurat.perm.null,"pseudobulk_DESeq2_Wald"= DEG.pseudobulk_Wald.perm.null), 
+                        pvalue = NULL, 
+                        color = c("tradeseq_time"= "#c6dbef", "tradeseq_slingshot" = "#2171b5", "tradeseq_psupertime"= "#032f5f", 
+                  "pseudobulk_DESeq2_Wald" = "#A65628","pseudobulk_DESeq2_LRT" = "#ef7c00","seurat_wilcox" = "#e7bd00",  
+                  "seurat_MAST" = "#fb6a4a","MAST_RE" = "#cb181d","seurat_MAST_latent" ="#a50f15" , 
+                  "MAST_longitudinal"= "#a1d99b",  "MAST_longitudinal_RE"= "#006d2c" ,"MAST_longitudinal_PID"= "#00441b",
+                  "linear_TDE" = "#ffb3ff", "mixed_TDE" =  "#984EA3")
+                        ){
+  
+data_plot <- data.frame()
+
+if(is.null(pvalue)){
+  create_pvalue <- TRUE }
+else{create_pvalue <- FALSE}
+
+# Generate data for plot
+for (m in names(DEG.perm)){
+  DEG_df <- DEG.perm[[m]]
+  
+  if(create_pvalue){
+  pvalue <- grep("^p.?val(ue)*((?!.adj))", names(DEG_df), perl = T, value = T)}
+  else{ pvalue <- pvalue }
+
+
+  data_plot<- rbind(data_plot, 
+    data.frame("method" = m,               
+               "p_val_null" = -log10(sort(ppoints(length(DEG_df[,pvalue])))), 
+               "p_val_test"  = -log10(sort(DEG_df[,pvalue]))
+               ))
+}
+
+data_plot$method <- factor(data_plot$method, levels = names(DEG.perm))
+
+p <- ggscatter(data = data_plot, x = "p_val_null",y = "p_val_test", group.by = "method", color = "method")+
+  geom_abline(intercept = 0, slope = 1, show.legend = T)+
+  ylim(0,5)+
+  scale_color_manual(values = color)+
+  annotate("label", label = "too conservative", x = 2, y=0.5)+
+  annotate("label", label = "too lenient", x = 0.35, y=3)+
+  xlab("-log10 expected pvalues")+ ylab("-log10 observed pvalues")+
+  theme(legend.position = "right", legend.title = element_blank())+ ggtitle("Pvalues under the null hypothesis")
+
+return(p)
+}
+```
+
+### FDR df
+```{r}
+perm_fdr_df <- function(DEG.perm = list("seurat_wilcox" = DEG.seurat.perm.null,"pseudobulk_DESeq2_Wald"= DEG.pseudobulk_Wald.perm.null), 
+                        permutations = c("perm1","perm2","perm3", "perm4", "perm5"),
+                        permutation_col = "permutation_round", 
+                        pvalue = NULL, 
+                        padj = NULL
+                        ){
+  
+fdr_df <- data.frame()
+
+if(is.null(pvalue)){
+  create_pvalue <- TRUE
+}
+else{create_pvalue <- FALSE}
+if(is.null(padj)){
+  create_padj <- TRUE
+}else{create_padj <- FALSE}
+
+
+for (m in names(DEG.perm)){
+  DEG_df <- DEG.perm[[m]]
+  
+  if(create_pvalue){
+  pvalue <- grep("^p.?val(ue)*((?!.adj))", names(DEG_df), perl = T, value = T)}
+  else{
+   pvalue <- pvalue 
+  }
+  if(create_padj){
+  padj <- grep(".adj", names(DEG_df), perl = T, value = T)}
+  else{
+    padj <- padj
+  }
+  
+  for (p in permutations){
+    fdr_df<- rbind(fdr_df, 
+    data.frame("method" = m, "perm" = p,"method_perm" = paste(m, p, sep = "_"),               
+  "fdr" = round(length(DEG_df[grepl(p, DEG_df[,permutation_col]) & DEG_df[,pvalue] < 0.05,"gene"])/length(DEG_df[grepl(p, DEG_df[,permutation_col]) , "gene"]),3), #fdr = significant genes/all genes tested
+    "false_positive_padj" = length(DEG_df[grepl(p, DEG_df[,permutation_col]) & DEG_df[,padj] < 0.05, "gene"])
+                 ))        
+  }}
+fdr_df$method <- factor(fdr_df$method, levels = names(DEG.perm))
+return(fdr_df)
+}
+```
+
+```{r}
+plot_FDR_box <- function(fdr_df, color = color_method){
+p <- ggplot(fdr_df, aes(method, fdr, color = method))+
+  geom_boxplot()+
+  scale_color_manual(values= color)+
+  geom_hline(yintercept = 0.05, linetype = "dashed")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1))+
+  ylab("FDR")+ xlab("")
+return(p)
+}
+
+
+plot_FDR_point <- function(fdr_df, color = color_method){
+p <- ggplot(fdr_df, aes(method, fdr, color = perm))+
+  geom_point()+
+  scale_color_manual("Permutation round", values= color_clusters)+
+  geom_hline(yintercept = 0.05, linetype = "dashed")+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1))+
+  ylab("FDR")+ xlab("")
+return(p)
+}
+
+```
+
+```{r}
+plot_false_positives <- function(fdr_df, color = color_method){
+aggregated_df <- fdr_df %>%
+  group_by(method) %>%
+  summarise(
+    mean_fdr = mean(fdr),
+    sum_false_positive_padj = sum(false_positive_padj)
+  )
+
+p <- ggplot(aggregated_df, aes(method, sum_false_positive_padj, fill = method))+
+  geom_bar(stat = "identity")+
+  scale_fill_manual(values= color)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1, vjust = 1))+
+  geom_text(stat='identity', aes(label=sum_false_positive_padj), position=position_dodge2(width=0.8), size=5, vjust=0, hjust=0.5)+
+  ylab("DEG (padj < 0.05)")+ xlab("")+
+  ggtitle("False positive DEG (padj < 0.05)")
+return(p)
+}
+```
+
+### Detection power
+
+```{r}
+Power_DEcall <- function(seurat_analysis,
+                        method = c("seurat_wilcox","seurat_MAST", "seurat_MAST_latent"), #Does support Seurat, MAST, TDESeq and Tradeseq DE call
+                        donor.var = "PID",
+                        time.var = "time",
+                        comparison.group1 = c("V2", "V3", "V4"), 
+                        comparison.group2 = rep("V1", 3),
+                        seurat.test.use = list(),
+                        min.pt = 0.1,
+                        gene_filter = seurat_analysis@assays$RNA@var.features,
+                        tde_method = c("linear"="cell", "mixed"="pseudocell"),
+                        cellWeights = NULL,
+                        nknots = 6,
+                        save_DEG = TRUE,
+                        save_model = FALSE,
+                        outdir = NULL,
+                        verbose = TRUE, 
+                        ncores = 1
+                         ){
+
+#Data prep
+  ## For seurat
+if(any(grepl("seurat", method, ignore.case = T) | grepl("MAST", method, ignore.case = T)& !grepl("longitudinal", method, ignore.case = T))){  
+    #Define comparisons
+  comparisons.df <- data.frame("group1" = comparison.group1, 
+                             "group2" = comparison.group2)
+  comparisons.df$comparison <- paste0(comparisons.df$group1, "_vs_", comparisons.df$group2)
+  
+  plan(multisession, workers = ncores)
+  } 
+
+  ## For MAST  
+if(any(!grepl("seurat", method, ignore.case = T) & grepl("MAST", method, ignore.case = T))){ 
+
+sca <- MAST::SceToSingleCellAssay(as.SingleCellExperiment(seurat_analysis))
+if(!is.null(gene_filter)){sca <- sca[gene_filter,]}
+options("mc.cores" = ncores)
+
+if(length(seurat_analysis@meta.data[,donor.var])> 60000 & any(grepl("longitudinal", method, ignore.case = T))){
+  print("Warning: Data with more than 60.000 cells causes errors in longitudinal MAST model fitting with ebayes. Setting ebayes to FALSE")
+  ebayes <- FALSE
+  }else{ebayes <- TRUE}
+} 
+
+  ## For TDESeq
+if(any(grepl("TDE", method, ignore.case = T))){
+counts<-GetAssayData(seurat_analysis,'counts')
+norm.data<-GetAssayData(seurat_analysis,'data')
+meta.data<-seurat_analysis@meta.data
+
+tde_power <- CreateTDEseqObject(counts = counts, data=norm.data, meta.data = meta.data)
+}
+
+  ## TradeSeq
+if(any(grepl("tradeseq", method, ignore.case = T))){
+BPPARAM <- BiocParallel::bpparam()
+BPPARAM$workers <- ncores
+}
+
+DEG.power <- list()  
+  
+for (m in method){  
+  if(verbose){print(m)}
+DEG.power[[m]] <- data.frame()
+
+# Seurat based tests
+if(grepl("seurat", m, ignore.case = T)){
+  #Determine the test to use based on the method string
+  test <- ifelse(grepl("wilcox", m, ignore.case = T),  "wilcox", 
+         ifelse(grepl("DESeq2", m, ignore.case = T),"DESeq2", 
+         ifelse(grepl("MAST", m, ignore.case = T),"MAST", seurat.test.use[[m]])))
+  
+  # Include latent variable based on method string
+ if (grepl("latent", m, ignore.case = TRUE)){
+  latent.var <- donor.var} else {
+  latent.var <- NULL }
+  
+
+
+  #Loop through comparisons
+for(c in comparisons.df$comparison){
+  if(verbose){print(paste0("Performing DE call for ", c))}
+  Idents(seurat_analysis) <- time.var
+  tmp <- FindMarkers(object = seurat_analysis,
+                     ident.1 = comparisons.df[comparisons.df$comparison==c,]$group1,
+                     ident.2 = comparisons.df[comparisons.df$comparison==c,]$group2,
+                     only.pos = FALSE,
+                     features = gene_filter,
+                     verbose = verbose,
+                     min.pct = min.pt,
+                     logfc.threshold = 0,
+                     test.use = test,
+                     latent.vars =  latent.var)
+  tmp <- tmp[!is.na(tmp$p_val),]
+  if (nrow(tmp) > 1){
+  tmp$comparison <- c
+  tmp$gene <- row.names(tmp)
+  tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$p_val_adj < 0.05, "sign", "ns")
+  tmp$comparison <- factor(tmp$comparison, levels=unique(tmp$comparison))
+  tmp$comparison_regulation <- paste(tmp$comparison, tmp$regulation, sep="_")
+  tmp$time <- str_split(tmp$comparison, "_", simplify = T)[,1]
+
+DEG.power[[m]] <- rbind(DEG.power[[m]], tmp)
+  }}} #close seurat loop
+
+
+# longitudinal MAST based tests
+if(!grepl("seurat", m, ignore.case = T) & grepl("MAST", m, ignore.case = T)& grepl("longitudinal", m, ignore.case = T)){
+
+zlmTime_power <- list()
+
+  ifelse(!is.numeric(time.var), x <- paste0(time.var, "_num"), x <- time.var) # numerical input is required
+  # Create formula based on method string
+  formula <- as.formula(ifelse(grepl("fixed", m, ignore.case = T)|grepl("FE", m, ignore.case = T),  paste("~", x, "+", donor.var), 
+         ifelse(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T),paste("~", x, "+ (1|", donor.var, ")"),
+         paste("~", x))))  
+  
+  if(verbose){print(paste("Fitting model for", time.var, "with formula:", deparse(formula)))}
+  
+  # Fit the MAST model
+  zlmTime_power[[time.var]] <- if(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T)){ 
+                      MAST::zlm(formula, sca, parallel = T, method = "glmer", ebayes = F)}
+                      else {
+                      MAST::zlm(formula, sca = sca, parallel = T, ebayes = ebayes)}   
+
+
+if(save_model){saveRDS(zlmTime_power, file = paste0(outdir, "zlm_",m,"_power.rds"))}
+
+
+  if(verbose){print(paste("Doing DE call for", time.var))}
+  ifelse(!is.numeric(time.var), x <- paste0(time.var, "_num"), x <- time.var)
+summaryCond_power <- MAST::summary(zlmTime_power[[time.var]], doLRT= x, parallel = T)
+
+
+summaryDt_power <- summaryCond_power$datatable
+tmp <- data.frame(merge(summaryDt_power[contrast==x & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                      summaryDt_power[contrast==x & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid')) #logFC coefficients
+
+colnames(tmp) <- c("gene", "p_val", "avg_log2FC", "ci.hi", "ci.lo")
+tmp <- tmp[!is.na(tmp$p_val),]
+tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+rownames(tmp) <- tmp$gene
+tmp$p_val_adj <- p.adjust(tmp$p_val, 'fdr')
+tmp$comparison <- "longitudinal"
+
+
+DEG.power[[m]] <- rbind(DEG.power[[m]], tmp)
+}# closing MAST loop 
+
+
+# MAST pairwise
+if(!grepl("seurat", m, ignore.case = T) & grepl("MAST", m, ignore.case = T)& !grepl("longitudinal", m, ignore.case = T)){
+
+zlmTime_power <- list()
+  for(control in unique(comparisons.df$group2)){
+  ifelse(is.character(time.var), x <- time.var, x <-as.character(time.var))# categorical input is required
+  colData(sca)[,x] <- factor(colData(sca)[,x])
+  colData(sca)[,x] <- relevel(colData(sca)[,x],control)
+  # Create formula based on method string
+  formula <- as.formula(ifelse(grepl("fixed", m, ignore.case = T)|grepl("FE", m, ignore.case = T),  paste("~", x, "+", donor.var), 
+         ifelse(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T),paste("~", x, "+ (1|", donor.var, ")"),
+         paste("~", x))))  
+  
+  if(verbose){print(paste("Fitting model for reference level: ",control, "with formula:", deparse(formula)))}
+  
+  #Fit the MAST model
+  zlmTime_power[[control]] <- if(grepl("random", m, ignore.case = T)|grepl("RE", m, ignore.case = T)){
+                      MAST::zlm(formula, sca, parallel = T, method = "glmer", ebayes = F)}
+                      else {
+                      MAST::zlm(formula, sca = sca, parallel = T, ebayes = ebayes)}
+
+
+if(save_model){saveRDS(zlmTime_power, file = paste0(outdir, "zlm_",m,"_power.rds"))}
+}
+
+  for (c in unique(comparisons.df$comparison)){
+  if(verbose){print(paste("Doing DE call for",c))}
+  a <- paste0(time.var,comparisons.df[comparisons.df$comparison == c,]$group1)
+summaryCond_power <- MAST::summary(zlmTime_power[[comparisons.df[comparisons.df$comparison == c,]$group2]], doLRT= a , parallel = T)
+
+
+summaryDt_power <- summaryCond_power$datatable
+tmp <- data.frame(merge(summaryDt_power[contrast==a & component=='H',.(primerid, `Pr(>Chisq)`)], #hurdle P values
+                      summaryDt_power[contrast==a & component=='logFC', .(primerid, coef, ci.hi, ci.lo)], by='primerid')) #logFC coefficients
+
+colnames(tmp) <- c("gene", "p_val", "avg_log2FC", "ci.hi", "ci.lo")
+tmp <- tmp[!is.na(tmp$p_val),]
+tmp$regulation <- ifelse(tmp$avg_log2FC > 0, "up", "down")
+rownames(tmp) <- tmp$gene
+tmp$p_val_adj <- p.adjust(tmp$p_val, 'fdr')
+tmp$comparison <- c
+
+
+DEG.perm[[m]] <- rbind(DEG.perm[[m]], tmp)
+}}# closing MAST pairwise loop 
+
+
+# TDESeq tests
+if(grepl("TDE", m, ignore.case = T)){
+ifelse(grepl("linear", m, ignore.case = T), tde_method <- tde_method["linear"], tde_method <- tde_method["mixed"] )
+model <- ifelse(grepl("mixed", m, ignore.case = T), "lmm", "lm")
+
+  tde_param <- list(sample.var = donor.var,
+                 stage.var = time.var,
+                 fit.model = model, # This defines the model to be linear or mixed
+                 tde.thr = 0.05,
+                 pct = min.pt,
+                 mod = 'FastLMM')
+
+tde_power <- tdeseq(object = tde_power, tde.method=tde_method, tde.param=tde_param, num.core= ncores)
+tmp <- GetTDEseqAssayData(tde_power, slot='tde')
+tmp <- tmp[!is.na(tmp$pvalue),]
+tmp$regulation <- ifelse(tmp$patter %in% c("Recession","Trough"),"down",
+                  ifelse(tmp$patter %in% c("None"), "None", 
+                  "up"))
+tmp$comparison <- "longitudinal"
+ DEG.power[[m]] <- rbind(DEG.power[[m]], tmp )
+}#closing TDESeq loop
+
+
+# Tradeseq
+if(grepl("tradeseq", m, ignore.case = T)){
+ 
+if (grepl("latent", m, ignore.case = TRUE)){
+  U <- model.matrix(~donor.var)} else { # (pseudo)time variable is added internally in the fitGAM function to the design matrix
+  U <- NULL }
+
+set.seed(42)
+ifelse(is.null(cellWeights),cellWeights <- data.frame("lineage" = rep(1, length(seurat_analysis[v,])), row.names = names(seurat_analysis[v,])), cellWeights <- cellWeights) # To define the lineages
+
+ifelse(is.null(gene_filter), genes <- seq_len(nrow(counts)), # default from tradeseq
+       genes <- gene_filter)
+
+gam_power <- list()
+
+  if(verbose){print(paste("Fitting model for", time.var))}
+gam_power[[time.var]] <- tradeSeq::fitGAM(counts = seurat_analysis@assays$RNA@counts,
+              pseudotime = seurat_analysis[[time.var]], 
+              cellWeights = cellWeights,
+              U = U,
+              nknots = nknots,
+              genes = genes,
+              parallel = TRUE,
+              BPPARAM = BPPARAM, 
+              verbose = verbose)
+
+if(save_model){saveRDS(gam_power, file = paste0(outdir,"GAM_", m, "_power.rds"))}
+
+  if(verbose){print(paste("Doing DE call for", time.var))}
+tmp <- associationTest(gam_power[[time.var]])
+tmp <- tmp[!(is.na(tmp$pvalue)), ]
+tmp$padj <- p.adjust(tmp$pvalue, method = "fdr")
+tmp <- tmp[order(tmp$padj), ]
+tmp$gene <- rownames(tmp)
+tmp$regulation <- NA
+tmp$comparison <- "longitudinal"
+
+DEG.power[[m]] <- rbind(DEG.power[[m]], tmp)
+
+}# close tradeseq loop 
+
+
+if(save_DEG){saveRDS(DEG.power[[m]], file = paste0(outdir, "DEG_",m,"_power.rds"))}
+}#closing methods loop
+return(DEG.power)
+}
+```
+
+#### pseudobulk
+```{r}
+generate_pseudobulk <- function(seurat_analysis,
+                        gene_filter = seurat_analysis@assays$RNA@var.features,
+                        gene_filter_count = NULL,
+                        time.var = "time", 
+                        assay = "RNA",
+                        design_matrix = ~ time + donor,
+                        save_DDS = FALSE,
+                        outdir = NULL,
+                        verbose = TRUE){
+  
+ pseudobulk_counts_perm <- list()
+sample_table_perm <- list()
+dds_perm <- list()
+
+pseudobulk_counts_perm[[time.var]] <- AggregateExpression(seurat_analysis, assays = assay , slot = "counts" ,return.seurat = F, group.by = paste0("PID_", time.var))[[assay]]
+
+# Filter for NAs
+pseudobulk_counts_perm[[time.var]] <- pseudobulk_counts_perm[[time.var]][!is.na(rownames(pseudobulk_counts_perm[[time.var]])),]
+
+# Generate Sample table from column names
+tmp <- data.frame(row.names = seq(1, length(as.character(colnames(pseudobulk_counts_perm[[time.var]])))))
+# mandatory columns
+
+## Ensure you generate a variable "ID" which matches the colnames in your pseudobulk counts matrix
+tmp$ID <- as.character(colnames(pseudobulk_counts_perm[[time.var]]))
+rownames(tmp) <- tmp$ID
+
+m <- stringr::str_split_fixed(as.character(colnames(pseudobulk_counts_perm[[time.var]])),pattern =  "_", n=2)
+# Ensure the presence of a column "condition" which will be used for the grouping of your samples
+tmp$condition <- factor(paste(m[,1], m[,2], sep="_"), levels = unique(paste(m[,1], m[,2], sep="_")))
+
+
+
+tmp$sample_name <- paste(m[,1], m[,2], sep="_")
+tmp$donor <- factor(m[,1], levels = sort(unique(m[,1])))
+
+
+# addtional columns
+tmp$time <- factor(m[,2], levels = sort(unique(m[,2])))
+
+
+# double-check your tmp includes all necessary information
+c("ID", "condition") %in% colnames(tmp)
+sample_table_perm[[time.var]] <- tmp
+
+dds_txi <- DESeqDataSetFromMatrix(countData = pseudobulk_counts_perm[[time.var]], colData = sample_table_perm[[time.var]] , design = as.formula(design_matrix))
+
+
+if(!is.null(gene_filter_count)){
+genes_to_keep <- rowSums(counts(dds_txi) >= gene_filter_count)}
+else{genes_to_keep <- gene_filter}
+
+dds <- dds_txi[genes_to_keep,]
+
+dds <- DESeq(dds)
+
+if(save_DDS){saveRDS(dds, file = paste0(outdir, "Pseudobulk_dds.rds"))}
+return(dds)
+}
+```
+
+```{r}
+Power_DEcall_pseudobulk <- function(dds,
+                        method = c("pseudobulk_DESeq2_Wald","pseudobulk_DESeq2_LRT"),
+                        comparison.group1 = c("V2", "V3", "V4"), 
+                        comparison.group2 = rep("V1", 3),
+                        design_matrix = ~ time + donor, 
+                        design_matrix_reduced = ~ donor, 
+                        donor.var = "PID",
+                        save_DEG = TRUE,
+                        outdir = NULL,
+                        verbose = TRUE, 
+                        ncores = 1, 
+                        multiple_testing = "IHW",
+                        pAdjustMethod = "BH",
+                        independentFiltering= TRUE,
+                        shrinkage = TRUE,
+                        shrinkType = "normal"){
+  
+if(ncores > 1){
+BPPARAM <- BiocParallel::bpparam()
+BPPARAM$workers <- ncores
+parallel <- TRUE}else{parallel <- FALSE}
+  
+DEG.power <- list()  
+  
+for (m in method){  
+  if(verbose){print(m)}
+DEG.power[[m]] <- data.frame()
+
+if(grepl("Wald", m, ignore.case = T)){
+ 
+# Generate Comparison table   
+comparison_table <- data.frame(comparison = comparison.group1,
+                               control = comparison.group2)
+
+
+
+design(dds) <- as.formula(design_matrix)
+
+norm_anno <- generate_norm_anno(dds_object = dds)
+
+# DE calculation
+DEresults_list <- list()
+
+for (i in unique(comparison_table$control)){
+  dds$time <- relevel(dds$time, i)
+  dds <- nbinomWaldTest(object = dds)
+  comparison_table_subset  <-  comparison_table[comparison_table$control == i, ]
+
+  DEresults <- DEAnalysis(input = dds,
+                          comparison_table = comparison_table_subset,
+                          condition = "time",
+                          alpha = 0.05 ,
+                          lfcThreshold = 0,
+                          sigFC = 2,
+                          multiple_testing = multiple_testing,
+                          pAdjustMethod = pAdjustMethod,
+                          shrinkage = shrinkage,
+                          shrinkType = shrinkType, 
+                          norm_anno = norm_anno)
+  
+  DEresults_list <- c(DEresults_list, DEresults)
+}
+
+DEresults <- DEresults_list[unique(names(DEresults_list))]
+tmp <- data_frame()
+for (n in names(DEresults)){
+  if (n != "parameters"){
+  DEresults[[n]]@results$comparison <- rep(n, nrow(DEresults[[n]]@results))
+  tmp <- rbind(tmp, DEresults[[n]]@results)
+  }}
+  tmp$time <- str_split(tmp$comparison, "_", simplify = T)[,1]
+  tmp$regulation <- ifelse(tmp$log2FoldChange > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$padj < 0.05, "sign", "ns")
+  tmp$comparison <- factor(tmp$comparison, levels=unique(tmp$comparison))
+  tmp$comparison_regulation <- paste(tmp$comparison, tmp$regulation, sep="_")
+  tmp$gene <- tmp$GENEID
+  tmp[,c("GeneID","SYMBOL","GENETYPE")] <- NULL
+
+DEG.power[[m]] <- rbind(DEG.power[[m]], tmp)
+  } #close Wald loop
+
+if(grepl("LRT", m, ignore.case = T)){
+
+design(dds) <- as.formula(design_matrix)
+
+# DE calculation
+dds_lrt <- DESeq(dds, test = "LRT", reduced = as.formula(design_matrix_reduced), parallel = parallel, BPPARAM = BPPARAM)
+
+tmp <- results(dds_lrt)
+  tmp$regulation <- ifelse(tmp$log2FoldChange > 0, "up", "down")
+  tmp$significance <- ifelse(tmp$padj < 0.05, "sign", "ns")
+  tmp$gene <- rownames(tmp)
+  tmp$comparison <- "longitudinal"
+
+DEG.power[[m]] <- rbind(DEG.power[[m]], as.data.frame(tmp))
+
+}#close LRT loop
+
+if(save_DEG){saveRDS(DEG.power[[m]], file = paste0(outdir,"DEG_",m,"_power.rds"))}
+}
+return(DEG.power)
+}
+
+
+```
+
+#### plot
+
+```{r}
+# Code provided by Fan et al. 2023 (TDESeq paper)
+FDR <- function(pvalue,pmatrix,permutation_time=5)
+{ 
+  FDR=numeric(length=length(pvalue))
+  n=length(pvalue)
+  b=pmatrix
+  for(i in 1:n)
+  {
+    num=length(which(b<pvalue[i]))
+    FDR[i]=num/(permutation_time*i)
+  }
+  return(FDR)
+}
+```
+
+```{r}
+detection_power_perm <- function(DEG.perm, DEG.power,permutation_time=5, pvalue = NULL){
+
+fdr <- list()
+# Generate data for plot
+for (m in names(DEG.power)){
+  DEG_df <- DEG.power[[m]]
+  perm <- DEG.perm[[m]]
+  
+  if(is.null(pvalue)){
+  pval <- grep("^p.?val(ue)*((?!.adj))", names(DEG_df), perl = T, value = T)}
+  else{ pval <- pvalue[[m]] }  
+  
+  fdr[[m]] <-FDR(DEG_df[,pval],perm[,pval],permutation_time = permutation_time)
+}
+avg_power <- list()
+for (n in names(fdr)){
+  fdr_method <- fdr[[n]]
+for (i in c(0.01, 0.025, 0.05, 0.075, 0.1)){
+  tmp <- length(which(fdr_method<i))/length(fdr_method)
+  avg_power[[n]] <- c(avg_power[[n]], tmp)}
+  names(avg_power[[n]]) <-  c(0.01 , 0.025, 0.05, 0.075, 0.1)} 
+
+avg_power_plot <- reshape2::melt(avg_power)
+names(avg_power_plot) <- c("value", "method")
+avg_power_plot$alpha <- c(0.01, 0.025, 0.05, 0.075, 0.1)
+
+
+avg_power_plot$method <- factor(avg_power_plot$method, levels = names(DEG.power))
+return(avg_power_plot)
+  }
+```
+
+
+
+```{r}
+detection_power_padj <- function(DEG.power, padj = NULL){
+
+fdr <- list()
+# Generate data for plot
+for (m in names(DEG.power)){
+  DEG_df <- DEG.power[[m]]
+  
+  if(is.null(padj)){
+  p <- grep(".adj", names(DEG_df), perl = T, value = T)}
+  else{p<- padj[[m]]}
+  
+  fdr[[m]] <- DEG_df[,p]
+}
+avg_power <- list()
+for (n in names(fdr)){
+  fdr_method <- fdr[[n]]
+for (i in c(0.01, 0.025, 0.05, 0.075, 0.1)){
+  tmp <- length(which(fdr_method<i))/length(fdr_method)
+  avg_power[[n]] <- c(avg_power[[n]], tmp)}
+  names(avg_power[[n]]) <-  c(0.01 , 0.025, 0.05, 0.075, 0.1)} 
+
+avg_power_plot <- reshape2::melt(avg_power)
+names(avg_power_plot) <- c("value", "method")
+avg_power_plot$alpha <- c(0.01, 0.025, 0.05, 0.075, 0.1)
+
+
+avg_power_plot$method <- factor(avg_power_plot$method, levels = names(DEG.power))
+return(avg_power_plot)  
+  
+}
+```
+
+
+```{r}
+plot_detection_power <- function(avg_power, color = color_method){
+ggplot(data= avg_power, aes(x = alpha, y = value, group.by = method, color = method))+
+  geom_line()+
+  theme_classic()+
+  scale_color_manual(values = color)+
+  xlab("Alpha")+ ylab("Average detection power")+
+  theme(legend.title = element_blank())+ ggtitle("Average detection power")
+}
+```
+
+
+---
+---
+
+
+### GOEA
+```{r}
+hallmark_genes_symbols <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/h.all.v7.4.symbols.gmt")
+# hallmark_genes         <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/h.all.v7.4.entrez.gmt")
+ 
+KEGG_genes_symbols     <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c2.cp.kegg.v7.4.symbols.gmt")
+# KEGG_genes             <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c2.cp.kegg.v7.4.entrez.gmt")
+
+GO_genes_symbols       <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c5.go.bp.v7.4.symbols.gmt")
+# GO_genes               <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c5.all.v7.4.entrez.gmt")
+
+C7_genes_symbols       <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c7.immunesigdb.v7.4.symbols.gmt")
+
+C5_genes_symbols       <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c5.go.mf.v7.4.symbols.gmt")
+C2_genes_symbols       <- read.gmt("/data/references/msigdb_v7.4/msigdb_v7.4_GMTs/c2.all.v7.4.symbols.gmt")
+```
+
+```{r}
+GOEA.of.list <- function(seurat_object,
+                         condition.list,
+                         GeneSets = c("GO","KEGG","Hallmark", "C7"),
+                         GOntology = "BP",
+                         pCorrection = "bonferroni",     
+                         pvalueCutoff = 0.1,      
+                         qvalueCutoff = 0.1       
+                         ){
+  
+  # present_genes <- rownames(seurat_object)
+  present_genes <- rownames(seurat_object)[rowSums(seurat_object)>20] #new
+  
+  # output lists
+  GO_list <- list()
+  KEGG_list <- list() 
+  HALLMARK_list <- list()
+  C7_list <- list()
+  C5_list <- list()
+  C2_list <- list()
+  
+  #go through different gene lists
+  for(i in names(condition.list)){
+    print(paste0("Performing enrichment for ", i))
+    #genes of interest
+    genes_oi <- condition.list[[i]]
+    
+    # GO enrichment
+    if("GO" %in% GeneSets){
+      print("Performing GO enrichment")
+      GO <- as.data.frame(enricher(gene = genes_oi,
+                                   TERM2GENE=GO_genes_symbols,
+                                   universe = present_genes,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff = qvalueCutoff))
+      if(nrow(GO)>0){GO$Condition <- paste(i)}
+    }
+    
+    # C7 enrichment
+    if("C7" %in% GeneSets){
+      print("Performing C7 enrichment")
+      C7 <- as.data.frame(enricher(gene = genes_oi,
+                                   TERM2GENE= C7_genes_symbols,
+                                   universe = present_genes,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff = qvalueCutoff))
+      if(nrow(C7)>0){C7$Condition <- paste(i)}
+    }
+       if("C5" %in% GeneSets){
+      print("Performing C5 enrichment")
+      C5 <- as.data.frame(enricher(gene = genes_oi,
+                                   TERM2GENE= C5_genes_symbols,
+                                   universe = present_genes,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff = qvalueCutoff))
+      if(nrow(C5)>0){C5$Condition <- paste(i)}
+       }
+    
+       if("C2" %in% GeneSets){
+      print("Performing C2 enrichment")
+      C2 <- as.data.frame(enricher(gene = genes_oi,
+                                   TERM2GENE= C2_genes_symbols,
+                                   universe = present_genes,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff = qvalueCutoff))
+      if(nrow(C2)>0){C2$Condition <- paste(i)}
+    }
+    
+    # KEGG enrichment
+    if("KEGG" %in% GeneSets){
+      print("Performing KEGG enrichment")
+      KEGG <- as.data.frame(enricher(gene          = genes_oi,
+                                     TERM2GENE     = KEGG_genes_symbols,
+                                     universe      = present_genes,
+                                     pAdjustMethod = pCorrection,
+                                     pvalueCutoff  = pvalueCutoff,
+                                     qvalueCutoff  = qvalueCutoff))
+      if(nrow(KEGG)>0){KEGG$Condition <- paste(i)}
+    }
+    
+    
+    # Hallmark enrichment
+    if("Hallmark" %in% GeneSets){
+      print("Performing Hallmark enrichment")
+      HALLMARK <- as.data.frame(enricher(gene          = genes_oi,
+                                         TERM2GENE     = hallmark_genes_symbols,
+                                         universe      = present_genes,
+                                         pAdjustMethod = pCorrection,
+                                         pvalueCutoff  = pvalueCutoff,
+                                         qvalueCutoff  = qvalueCutoff))
+      if(nrow(HALLMARK)>0){HALLMARK$Condition <- paste(i)}
+    }
+    
+    
+    #concatenate output
+    if("GO" %in% GeneSets){ GO_list[[paste(i)]] <- GO }
+    if("KEGG" %in% GeneSets){ KEGG_list[[paste(i)]] <- KEGG }
+    if("Hallmark" %in% GeneSets){ HALLMARK_list[[paste(i)]] <- HALLMARK }
+    if("C7" %in% GeneSets){ C7_list[[paste(i)]] <- C7}
+    if("C5" %in% GeneSets){ C5_list[[paste(i)]] <- C5}
+    if("C2" %in% GeneSets){ C2_list[[paste(i)]] <- C2}
+  }
+  
+  results <- list()
+  results$GOresults <- do.call(rbind, GO_list)
+  results$KEGGresults <- do.call(rbind, KEGG_list)
+  results$HALLMARKresults <- do.call(rbind, HALLMARK_list)
+  results$C7results <- do.call(rbind, C7_list)
+  results$C5results <- do.call(rbind, C5_list)
+  results$C2results <- do.call(rbind, C2_list)
+  return(results)
+}
+```
+
+```{r}
+#Adaptet from GOEA.of.list
+GOEA.of.cds <- function(cds,
+                         gene_module_df,
+                         GeneSets = c("GO","KEGG","Hallmark"),
+                         GOntology = "BP",
+                         pCorrection = "bonferroni",     
+                         pvalueCutoff = 0.1,      
+                         qvalueCutoff = 0.1       
+                         ){
+  
+  # present_genes <- rownames(seurat_object)
+  present_genes <- rownames(cds)
+  
+  # output lists
+  GO_list <- list()
+  KEGG_list <- list() 
+  HALLMARK_list <- list() 
+  
+  #go through different gene lists
+  for(i in unique(gene_module_df$module)){
+    print(paste0("Performing enrichment for ", i))
+    #genes of interest
+    genes_oi <- gene_module_df[gene_module_df$module == i,]$id
+    
+    # GO enrichment
+    if("GO" %in% GeneSets){
+      print("Performing GO enrichment")
+      GO <- as.data.frame(enricher(gene = genes_oi,
+                                   TERM2GENE=GO_genes_symbols,
+                                   universe = present_genes,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff = qvalueCutoff))
+      if(nrow(GO)>0){GO$Condition <- paste(i)}
+    }
+    
+    # KEGG enrichment
+    if("KEGG" %in% GeneSets){
+      print("Performing KEGG enrichment")
+      KEGG <- as.data.frame(enricher(gene          = genes_oi,
+                                     TERM2GENE     = KEGG_genes_symbols,
+                                     universe      = present_genes,
+                                     pAdjustMethod = pCorrection,
+                                     pvalueCutoff  = pvalueCutoff,
+                                     qvalueCutoff  = qvalueCutoff))
+      if(nrow(KEGG)>0){KEGG$Condition <- paste(i)}
+    }
+    
+    
+    # Hallmark enrichment
+    if("Hallmark" %in% GeneSets){
+      print("Performing Hallmark enrichment")
+      HALLMARK <- as.data.frame(enricher(gene          = genes_oi,
+                                         TERM2GENE     = hallmark_genes_symbols,
+                                         universe      = present_genes,
+                                         pAdjustMethod = pCorrection,
+                                         pvalueCutoff  = pvalueCutoff,
+                                         qvalueCutoff  = qvalueCutoff))
+      if(nrow(HALLMARK)>0){HALLMARK$Condition <- paste(i)}
+    }
+    
+    
+    #concatenate output
+    if("GO" %in% GeneSets){ GO_list[[paste(i)]] <- GO }
+    if("KEGG" %in% GeneSets){ KEGG_list[[paste(i)]] <- KEGG }
+    if("Hallmark" %in% GeneSets){ HALLMARK_list[[paste(i)]] <- HALLMARK }
+  }
+  
+  results <- list()
+  results$GOresults <- do.call(rbind, GO_list)
+  results$KEGGresults <- do.call(rbind, KEGG_list)
+  results$HALLMARKresults <- do.call(rbind, HALLMARK_list)
+  return(results)
+}
+```
+
+### Dotplot GOEA list
+```{r}
+dotplot.GOEA.list <- function(enrich.df,
+                              show = 10,
+                              orderBy = c("count", "padj"), 
+                              colorBy = c("padj", "regulation")
+  ){
+  if(nrow(enrich.df) < 1){
+    print("No enrichment found.")
+  }else{
+    
+    #ORDERING
+    if(orderBy=="padj"){
+      enrich.df %>% group_by(Condition) %>% arrange(desc(Count), .by_group = TRUE) -> enrich.df
+      enrich.df %>% group_by(Condition) %>% arrange(desc(Count), .by_group = TRUE) %>% top_n(n = -show, wt = p.adjust) %>% pull(Description) -> terms
+      enrich.df <- enrich.df[enrich.df$Description %in% terms, ]
+      enrich.df$Description <- ifelse(nchar(enrich.df$Description) > 80, paste(substr(enrich.df$Description, 1, 80), "[...]", sep=""), enrich.df$Description)
+      enrich.df$Description <- factor(enrich.df$Description, levels = rev(unique(enrich.df$Description)))
+      
+      if(colorBy=="regulation"){
+      enrich.df$DE.regulation <- "no"
+      if(nrow(enrich.df[grep("_up", enrich.df$Condition),])>0){ enrich.df[grep("_up", enrich.df$Condition),]$DE.regulation <- "up" }
+      if(nrow(enrich.df[grep("_down", enrich.df$Condition),])>0){ enrich.df[grep("_down", enrich.df$Condition),]$DE.regulation <- "down" }
+      
+      p <- ggplot(data=enrich.df ,aes(x=Condition, y=Description, size=Count , fill=DE.regulation)) +
+        geom_point(pch=21) +
+        scale_radius() +
+        scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+        theme_bw() +
+        theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+              text = element_text(size = 12)) +
+        xlab("") + ylab("") 
+     return(p)
+    }
+    
+    if(colorBy=="padj"){  
+     p <- ggplot(data=enrich.df, aes(x=Condition, y=Description, color=p.adjust)) +
+        geom_point(aes(size = Count)) +
+        scale_colour_gradientn(colours=c('red', 'orange', 'darkblue', 'darkblue'),
+                               limits=c(0,1),
+                               values   = c(0,0.05,0.2,0.5,1),
+                               breaks   = c(0.05,0.2,1),
+                               labels = format(c(0.05,0.2,1))) +
+        ylab(T) +
+        theme_bw() +
+        theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+              text = element_text(size = 12))
+    return(p)
+    }
+    }
+    
+    if(orderBy=="count"){
+      enrich.df %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) -> enrich.df
+      enrich.df %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) %>% top_n(n=show, wt=Count) %>% pull(Description) -> terms
+      enrich.df <- enrich.df[enrich.df$Description %in% terms,]
+      enrich.df$Description <- ifelse(nchar(enrich.df$Description)>80, paste(substr(enrich.df$Description, 1, 80),"[...]",sep=""), enrich.df$Description)
+      enrich.df$Description <- factor(enrich.df$Description, levels = rev(unique(enrich.df$Description)))
+      
+      
+      if(colorBy=="regulation"){
+        enrich.df$DE.regulation<-"no"
+        if(nrow(enrich.df[grep("_up", enrich.df$Condition),])>0){ enrich.df[grep("_up", enrich.df$Condition),]$DE.regulation<-"up" }
+        if(nrow(enrich.df[grep("_down", enrich.df$Condition),])>0){ enrich.df[grep("_down", enrich.df$Condition),]$DE.regulation<-"down" }
+      
+      p <- ggplot(data=enrich.df ,aes(x=Condition, y=Description, size=Count, fill=DE.regulation)) +
+        geom_point(pch=21) + 
+        scale_radius() +
+        scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+        theme_bw()+
+        theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+              text = element_text(size = 12))+
+        xlab("") + ylab("")
+     return(p)
+    }
+    
+    if(colorBy=="padj"){  
+     p <- ggplot(data=enrich.df, aes(x=Condition, y=Description, color=p.adjust)) +
+       geom_point(aes(size = Count)) +
+       scale_colour_gradientn(colours=c('red', 'orange', 'darkblue', 'darkblue'),
+                               limits=c(0,1),
+                               values   = c(0,0.05,0.2,0.5,1),
+                               breaks   = c(0.05,0.2,1),
+                               labels = format(c(0.05,0.2,1))) +
+        ylab(T) +
+        theme_bw() +
+        theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+              text = element_text(size = 12))
+    return(p)
+    }
+   }
+  }
+}
+```
+
+## Parallelization
+```{r}
+cl <- makeCluster(8)
+registerDoParallel(cl)
+plan("multisession", workers = 5)
+options(future.globals.maxSize= 16000 * 1024^2)
+```
+
+
+
+
+## Colors
+
+```{r}
+library(devtools)
+#library(tidydr)
+#library(patchwork)
+```
+
+```{r}
+color_clusters <- c(RColorBrewer::brewer.pal(n = 9,name = "Set1"),
+                    RColorBrewer::brewer.pal(n = 8,name = "Set2"),
+                    RColorBrewer::brewer.pal(n = 12,name = "Set3"),
+                    RColorBrewer::brewer.pal(n = 12,name = "Paired"),
+                    RColorBrewer::brewer.pal(n = 9,name = "Pastel1"),
+                    RColorBrewer::brewer.pal(n = 8,name = "Pastel2"),
+                    RColorBrewer::brewer.pal(n = 8,name = "Accent"))
+
+color_method <- c("tradeseq_time"= "#c6dbef", "tradeseq_slingshot" = "#2171b5", "tradeseq_psupertime"= "#032f5f", 
+                  "pseudobulk_DESeq2_Wald" = "#A65628","pseudobulk_DESeq2_LRT" = "#ef7c00","seurat_wilcox" = "#e7bd00",  
+                  "seurat_MAST" = "#fb6a4a","MAST_RE" = "#cb181d","seurat_MAST_latent" ="#a50f15" , 
+                  "MAST_longitudinal"= "#a1d99b",  "MAST_longitudinal_RE"= "#006d2c" ,"MAST_longitudinal_PID"= "#00441b","MAST_longitudinal_fixed"= "#00441b",
+                  "linear_TDE" = "#ffb3ff", "mixed_TDE" =  "#984EA3")
+
+```
+
+------
+------
+
+# Load seurat 
+
+```{r}
+seurat_analysis <- readRDS("/data/references/public_datasets/Vasaikar_NatureCommunications_2023/PALMO_seurat_monocytes_cleaned_LL.rds")
+```
+
+```{r}
+color_time <- viridis::viridis(6)
+names(color_time) <- c("W2", "W3", "W4", "W5", "W6", "W7")
+```
+
+
+```{r fig.width=12, fig.height=5}
+p1 <- Seurat::DimPlot(seurat_analysis, 
+              reduction = "umap", 
+              group.by = "celltype", 
+              cols = color_clusters,
+              shuffle = TRUE)+ ggplot2::coord_fixed() + theme_dr() + ggplot2::theme(panel.grid = ggplot2::element_blank())
+
+p2 <- Seurat::DimPlot(seurat_analysis, 
+              reduction = "umap", 
+              group.by = "time", 
+              cols = color_time,
+              shuffle = TRUE)+ ggplot2::coord_fixed() + theme_dr() + ggplot2::theme(panel.grid = ggplot2::element_blank())
+
+
+p3 <- Seurat::DimPlot(seurat_analysis, 
+              reduction = "umap", 
+              group.by = "PID", 
+              cols = color_clusters,
+              shuffle = TRUE)+ ggplot2::coord_fixed() + theme_dr() + ggplot2::theme(panel.grid = ggplot2::element_blank())
+
+p1 + p2 + p3 + plot_layout(ncol = 3)
+```
+
+
+```{r}
+# Path to your output directory
+outdir <- "/data/Femmunity/analysis/laura/external_data/PALMO/test_package/"
+```
+
+
+```{r}
+seurat_analysis$time <- seurat_analysis$time #assign your time variable to this slot
+seurat_analysis$time_num <- as.numeric(stringr::str_split(seurat_analysis$time,"W", simplify = T)[,2])  #put a numeric version of your time variable in this slot, 0 are not possible 
+seurat_analysis$PID <- seurat_analysis$PID #assign your donor variable to this slot
+
+#Create Donor time combined variable
+seurat_analysis$PID_time <- paste(seurat_analysis$PID, seurat_analysis$time, sep = "_")
+seurat_analysis$PID_time_num <- paste(seurat_analysis$PID, seurat_analysis$time_num, sep = "_")
+
+## assign your pseudotime variable if needed
+#seurat_analysis$pseudotime <- seurat_analysis$slingshot 
+```
+
+```{r}
+Seurat::Idents(seurat_analysis) <- "time"
+
+## variable genes
+seurat_analysis <- Seurat::FindVariableFeatures(object = seurat_analysis, assay="RNA", selection.method = 'vst', nfeatures=5000)
+```
+
+```{r}
+load_all()
+```
+
+
+```{r, warning=FALSE}
+#undebug("permutation")
+seurat_analysis <- permutation(seurat_analysis, method = "longitudinal", numeric = "custom", numeric.function = function(x){as.numeric(str_split(x, pattern =  "W", simplify = T)[,2])})
+```
+
+#Example workflow
+
+```{r}
+corr.plot.permutation(seurat_analysis, time.var = "time", numeric.function = function(x){as.numeric(str_split(x, pattern =  "W", simplify = T)[,2])} )
+```
+
+```{r, fig.width= 10}
+plot.donor.permutation(seurat_analysis, color = color_time)
+```
+
+## Permutation DE call
+
+```{r}
+dds_perm <- generate_pseudobulk_perm(seurat_analysis = seurat_analysis)
+```
+
+```{r}
+undebug("Perm_DEcall_pseudobulk")
+DEG.perm <- Perm_DEcall_pseudobulk(dds_perm, method = c("pseudobulk_DESeq2_Wald","pseudobulk_DESeq2_LRT"),
+comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+comparison.group2 = rep("W2", 5),
+ save_DEG = F, outdir = outdir, shrinkType = "apeglm")
+```
+
+```{r}
+debug("Perm_DEcall")
+DEG.perm <- Perm_DEcall(seurat_analysis = seurat_analysis, method = c(
+#"seurat_wilcox",
+#"linear_TDE"
+#"mixed_TDE",
+#"seurat_MAST",
+#"seurat_MAST_latent",
+#"MAST_longitudinal",
+#"MAST_longitudinal_RE",
+#"MAST_longitudinal_fixed",
+#"MAST_RE",
+#"tradeseq_latent"
+ ),
+comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+comparison.group2 = rep("W2", 5),
+ save_DEG = F, ncores = 5, gene_filter = seurat_analysis@assays$RNA@var.features[1:50], tde_method = c("linear" = "cell", "mixed"="pseudocell"), outdir = outdir)
+```
+
+
+```{r}
+DEG.perm <- readRDS("/data/Femmunity/analysis/laura/FDR_results_summary/241212_DEG_perm_palmo.rds")
+```
+
+
+```{r, fig.width=15, fig.height=8}
+plot_DEG(DEG.perm = DEG.perm)
+```
+
+## QQ plot
+
+```{r, fig.width= 10, fig.height=5}
+#undebug("Perm_QQplot")
+Perm_QQplot(DEG.perm = DEG.perm  , color = color_method)
+```
+
+## FDR df
+
+```{r}
+fdr_df <- perm_fdr_df(DEG.perm = DEG.perm)
+```
+
+
+```{r}
+p1 <- plot_FDR_box(fdr_df)
+p1  
+```
+
+```{r}
+p2 <- plot_false_positives(fdr_df)
+p2
+```
+```{r, fig.height= 10, fig.width= 10}
+p1 + p2 + plot_layout(nrow= 2)
+```
+```{r}
+plot_FDR_point(fdr_df)
+```
+
+### Detection power
+
+```{r}
+outdir <- "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_"
+```
+
+
+```{r}
+dds <- generate_pseudobulk(seurat_analysis)
+```
+
+```{r}
+# DEG.power <- Power_DEcall_pseudobulk(dds, method = c("pseudobulk_DESeq2_Wald",
+#   "pseudobulk_DESeq2_LRT"),
+# comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+# comparison.group2 = rep("W2", 5),
+#  save_DEG = F, outdir = outdir, shrinkType = "apeglm")
+```
+
+```{r}
+# undebug("Power_DEcall")
+# DEG.power <- Power_DEcall(seurat_analysis = seurat_analysis, method = c(
+# #"seurat_wilcox",
+# #"linear_TDE",
+# #"mixed_TDE",
+# # "seurat_MAST",
+# # "seurat_MAST_latent",
+# # "MAST_longitudinal",
+# # "MAST_longitudinal_RE",
+# # "MAST_longitudinal_fixed",
+# #"tradeseq_latent"
+#  ),
+# comparison.group1 = c("W3", "W4", "W5", "W6","W7"),
+# comparison.group2 = rep("W2", 5),
+# gene_filter = seurat_analysis@assays$RNA@var.features[1:50], tde_method = c("linear" = "cell", "mixed"="pseudocell"),
+# save_DEG = F, ncores = 5,  outdir = outdir)
+```
+
+```{r}
+DEG.power <- load_DEG( c("seurat_wilcox" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_wilcox_power.rds",
+ "pseudobulk_DESeq2_Wald"= "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_pseudobulk_DESeq2_Wald_power.rds",
+ "pseudobulk_DESeq2_LRT"= "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_pseudobulk_DESeq2_LRT_power.rds", 
+ "linear_TDE" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_linear_TDE_power.rds",
+ "mixed_TDE" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_mixed_TDE_power.rds",
+ "seurat_MAST" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_MAST_power.rds",
+ "seurat_MAST_latent" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_seurat_MAST_latent_power.rds",
+ "MAST_longitudinal"  = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_power.rds",
+ "MAST_longitudinal_RE"  = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_RE_power.rds",
+ "MAST_longitudinal_fixed" = "/data/Femmunity/analysis/laura/external_data/PALMO/v3/detection_power/241212_DEG_MAST_longitudinal_fixed_power.rds"))
+```
+
+```{r}
+avg_power <- detection_power_padj(DEG.power)
+```
+
+```{r, fig.height= 5}
+plot_detection_power(avg_power)
+```
+
+------
+------
+
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+

@@ -1,0 +1,34 @@
+Package: Permutation
+Title: Permutation workflow to calculate FDR in a given dataset
+Version: 0.0.0.9000
+Authors@R: 
+    person("Laura", "Lang", , "llang@uni-bonn.de", role = c("aut", "cre"))
+Description: Permutation workflow to calculate FDR in a given dataset.
+License: GPL (>= 3)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.2.3
+Imports: 
+    BiocParallel,
+    corrplot,
+    DESeq2,
+    dplyr,
+    future,
+    GenomicRanges,
+    ggplot2,
+    ggpubr,
+    IHW,
+    MAST,
+    patchwork,
+    reshape2,
+    S4Vectors,
+    Seurat,
+    SeuratObject,
+    TDEseq,
+    SingleCellExperiment,
+    stats,
+    stringr,
+    tradeSeq,
+    data.table,
+    lme4,
+    tidydr
