@@ -1,23 +1,18 @@
 # Permutation workflow
 
-The Permutation packe offers functions to determine 
-
-## Getting started
-
 The permutation package offers functions to determine the FDR and p-value calibration in multiple-time point scRNA seq data. It takes the data in the commonly used Seurat object format and carries out permutation of time labels. Further, FDR can be calculated after DE analysis with Seurat (Wilcoxon rank sum), MAST, DESeq2, TDESeq and Tradeseq. 
+
 
 # Install package 
 ```
-# install.packages(“devtools”) 
-devtools::install_git("git@gitlab.dzne.de:langl/fdr-workflow.git", upgrade = "never")
+# install.packages("devtools") 
+devtools::install_git("LaMa-La/Permutation", upgrade = "never")
 ```
 The package is optimized for the use with of the docker container from Jonas Schulte-Schrepping (https://github.com/jsschrepping/r_docker/tree/r_docker_4.3.0#)
 
 # Example workflow 
 
 ```{r}
- # devtools::install_git("git@gitlab.dzne.de:langl/fdr-workflow.git", upgrade = "never")
-
 library(future)
 library(future.apply)
 library(parallel)
